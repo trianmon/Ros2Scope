@@ -311,6 +311,8 @@ public:
     }
 
     ImGui::SliderInt("Throttle (ms)", &throttle_ms_, 0, 1000);
+    ImGui::SliderInt("Decode throttle (ms)", &decode_throttle_ms_, 0, 2000);
+    ImGui::SliderInt("Max array items", &max_array_items_, 0, 512);
     ImGui::Checkbox("Autoscroll", &autoscroll_);
     ImGui::Checkbox("Pause", &paused_);
     ImGui::SliderInt("Max messages", &max_messages_, 50, 5000);
@@ -372,6 +374,8 @@ public:
 
     ImGui::Separator();
     ImGui::Text("Received: %llu", static_cast<unsigned long long>(message_counter_.load()));
+    ImGui::SameLine();
+    ImGui::Text("Decoded: %llu", static_cast<unsigned long long>(decoded_counter_.load()));
 
     ImGui::BeginChild("message_view", ImVec2(0.0f, 0.0f), true);
     {
@@ -443,6 +447,12 @@ public:
       }
 
       node.value = "size=" + std::to_string(item_count);
+      const std::size_t array_limit = static_cast<std::size_t>(std::max(0, max_array_items_));
+      if (item_count > array_limit) {
+        node.value += ", skipped large array (limit=" + std::to_string(array_limit) + ")";
+        return node;
+      }
+
       for (std::size_t index = 0; index < item_count; ++index) {
         const void *item_ptr = member.get_const_function != nullptr ? member.get_const_function(field_ptr, index) : nullptr;
         if (item_ptr == nullptr) {
@@ -621,6 +631,7 @@ private:
     std::scoped_lock lock(messages_mutex_);
     messages_.clear();
     message_counter_.store(0);
+    decoded_counter_.store(0);
   }
 
   std::string formatSerialized(const rclcpp::SerializedMessage &message) const {
@@ -662,6 +673,7 @@ private:
     prepareTypeSupportForSelectedType();
 
     last_emit_time_ = std::chrono::steady_clock::time_point{};
+    last_decode_time_ = std::chrono::steady_clock::time_point{};
     const bool ok = core_context_->ros_bridge->subscribeGeneric(
         selected_topic_,
         selected_type_,
@@ -682,14 +694,25 @@ private:
           prefix << "#" << (message_counter_.load() + 1) << " [" << selected_topic_ << "] ";
           auto line = prefix.str() + formatSerialized(message);
 
-          std::scoped_lock lock(messages_mutex_);
-          messages_.push_back(std::move(line));
-          while (messages_.size() > static_cast<std::size_t>(std::max(10, max_messages_))) {
-            messages_.pop_front();
+          {
+            std::scoped_lock lock(messages_mutex_);
+            messages_.push_back(std::move(line));
+            while (messages_.size() > static_cast<std::size_t>(std::max(10, max_messages_))) {
+              messages_.pop_front();
+            }
           }
           message_counter_.fetch_add(1);
 
+          const int decode_throttle = decode_throttle_ms_;
+          const auto decode_now = std::chrono::steady_clock::now();
+          if (decode_throttle > 0 && last_decode_time_ != std::chrono::steady_clock::time_point{} &&
+              decode_now - last_decode_time_ < std::chrono::milliseconds(decode_throttle)) {
+            return;
+          }
+
+          last_decode_time_ = decode_now;
           updateValueTreeFromSerialized(message);
+          decoded_counter_.fetch_add(1);
         });
 
     subscribed_ = ok;
@@ -715,12 +738,16 @@ private:
   bool autoscroll_{true};
   bool paused_{false};
   int throttle_ms_{0};
+  int decode_throttle_ms_{250};
+  int max_array_items_{64};
   int max_messages_{500};
 
   std::mutex messages_mutex_;
   std::deque<std::string> messages_;
   std::atomic<std::uint64_t> message_counter_{0};
+  std::atomic<std::uint64_t> decoded_counter_{0};
   std::chrono::steady_clock::time_point last_emit_time_{};
+  std::chrono::steady_clock::time_point last_decode_time_{};
   std::chrono::steady_clock::time_point last_topic_refresh_{};
   std::string last_schema_type_;
   std::string schema_error_;
