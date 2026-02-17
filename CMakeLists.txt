@@ -14,7 +14,12 @@ find_package(rcpputils REQUIRED)
 find_package(OpenGL REQUIRED)
 
 if(NOT TARGET rclcpp::rclcpp)
-	message(FATAL_ERROR "rclcpp target not found. Source ROS environment first: source /opt/ros/jazzy/setup.bash")
+	if(DEFINED ENV{ROS_DISTRO} AND NOT "$ENV{ROS_DISTRO}" STREQUAL "")
+		set(_r2s_ros_distro "$ENV{ROS_DISTRO}")
+	else()
+		set(_r2s_ros_distro "<ros_distro>")
+	endif()
+	message(FATAL_ERROR "rclcpp target not found. Source ROS environment first: source /opt/ros/${_r2s_ros_distro}/setup.bash")
 endif()
 
 FetchContent_Declare(
