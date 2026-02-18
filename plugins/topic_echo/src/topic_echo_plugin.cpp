@@ -43,6 +43,28 @@ struct ValueTreeNode {
   std::vector<ValueTreeNode> children;
 };
 
+enum class PresetProfile {
+  Auto = 0,
+  Normal = 1,
+  Image = 2,
+  Custom = 3,
+};
+
+struct TopicPresetBinding {
+  struct Settings {
+    int throttle_ms{0};
+    int decode_throttle_ms{250};
+    int max_array_items{64};
+    bool skip_large_arrays{true};
+    int max_messages{500};
+  };
+
+  std::string topic;
+  std::string type;
+  PresetProfile profile;
+  Settings settings;
+};
+
 std::string trim(const std::string &value) {
   const auto begin = value.find_first_not_of(" \t\r\n");
   if (begin == std::string::npos) {
@@ -292,6 +314,7 @@ public:
           unsubscribeCurrentTopic();
           selected_topic_ = topic.name;
           selected_type_ = topic.type;
+          applyPresetForCurrentTopic();
           clearMessages();
           value_tree_.clear();
           value_error_.clear();
@@ -313,13 +336,40 @@ public:
       refreshFieldTree();
     }
 
-    ImGui::SliderInt("Throttle (ms)", &throttle_ms_, 0, 1000);
-    ImGui::SliderInt("Decode throttle (ms)", &decode_throttle_ms_, 0, 2000);
-    ImGui::SliderInt("Max array items", &max_array_items_, 0, 512);
-    ImGui::Checkbox("Skip large arrays", &skip_large_arrays_);
+    ImGui::Separator();
+    ImGui::TextUnformatted("Profile");
+    int profile_index = static_cast<int>(active_profile_);
+    static const char *kProfileLabels[] = {"Auto", "Normal", "Image", "Custom"};
+    if (ImGui::Combo("Preset", &profile_index, kProfileLabels, IM_ARRAYSIZE(kProfileLabels))) {
+      const auto selected_profile = static_cast<PresetProfile>(profile_index);
+      if (selected_profile == PresetProfile::Custom) {
+        active_profile_ = PresetProfile::Custom;
+      } else {
+        applyPreset(selected_profile, false);
+      }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Apply preset") && active_profile_ != PresetProfile::Custom) {
+      applyPreset(active_profile_, false);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save for topic") && !selected_topic_.empty()) {
+      savePresetForCurrentTopic(active_profile_);
+    }
+
+    bool settings_changed = false;
+    settings_changed |= ImGui::SliderInt("Throttle (ms)", &throttle_ms_, 0, 1000);
+    settings_changed |= ImGui::SliderInt("Decode throttle (ms)", &decode_throttle_ms_, 0, 2000);
+    settings_changed |= ImGui::SliderInt("Max array items", &max_array_items_, 0, 512);
+    settings_changed |= ImGui::Checkbox("Skip large arrays", &skip_large_arrays_);
+    if (settings_changed) {
+      active_profile_ = PresetProfile::Custom;
+    }
     ImGui::Checkbox("Autoscroll", &autoscroll_);
     ImGui::Checkbox("Pause", &paused_);
-    ImGui::SliderInt("Max messages", &max_messages_, 50, 5000);
+    if (ImGui::SliderInt("Max messages", &max_messages_, 50, 5000)) {
+      active_profile_ = PresetProfile::Custom;
+    }
 
     if (!selected_topic_.empty() && !subscribed_) {
       if (ImGui::Button("Subscribe")) {
@@ -631,6 +681,111 @@ public:
   }
 
 private:
+  bool looksLikeImageTopic(const std::string &topic_name, const std::string &type_name) const {
+    if (type_name == "sensor_msgs/msg/Image" || type_name == "sensor_msgs/msg/CompressedImage") {
+      return true;
+    }
+
+    const std::string topic_lower = trim(topic_name);
+    return topic_lower.find("image") != std::string::npos || topic_lower.find("camera") != std::string::npos;
+  }
+
+  PresetProfile autoDetectPresetForCurrentTopic() const {
+    if (looksLikeImageTopic(selected_topic_, selected_type_)) {
+      return PresetProfile::Image;
+    }
+    return PresetProfile::Normal;
+  }
+
+  void savePresetForCurrentTopic(PresetProfile profile) {
+    if (selected_topic_.empty() || selected_type_.empty()) {
+      return;
+    }
+
+    TopicPresetBinding::Settings settings;
+    settings.throttle_ms = throttle_ms_;
+    settings.decode_throttle_ms = decode_throttle_ms_;
+    settings.max_array_items = max_array_items_;
+    settings.skip_large_arrays = skip_large_arrays_;
+    settings.max_messages = max_messages_;
+
+    for (auto &binding : topic_presets_) {
+      if (binding.topic == selected_topic_ && binding.type == selected_type_) {
+        binding.profile = profile;
+        binding.settings = settings;
+        return;
+      }
+    }
+
+    topic_presets_.push_back(TopicPresetBinding{
+        .topic = selected_topic_,
+        .type = selected_type_,
+        .profile = profile,
+        .settings = settings,
+    });
+  }
+
+  void applySettings(const TopicPresetBinding::Settings &settings) {
+    throttle_ms_ = settings.throttle_ms;
+    decode_throttle_ms_ = settings.decode_throttle_ms;
+    max_array_items_ = settings.max_array_items;
+    skip_large_arrays_ = settings.skip_large_arrays;
+    max_messages_ = settings.max_messages;
+  }
+
+  void applyPreset(PresetProfile requested_profile, bool remember_for_topic) {
+    PresetProfile resolved_profile = requested_profile;
+    if (requested_profile == PresetProfile::Auto) {
+      resolved_profile = autoDetectPresetForCurrentTopic();
+    }
+
+    switch (resolved_profile) {
+      case PresetProfile::Image:
+        applySettings(TopicPresetBinding::Settings{
+            .throttle_ms = 33,
+            .decode_throttle_ms = 300,
+            .max_array_items = 16,
+            .skip_large_arrays = true,
+            .max_messages = 200,
+        });
+        break;
+      case PresetProfile::Normal:
+        applySettings(TopicPresetBinding::Settings{
+            .throttle_ms = 0,
+            .decode_throttle_ms = 150,
+            .max_array_items = 128,
+            .skip_large_arrays = false,
+            .max_messages = 500,
+        });
+        break;
+      case PresetProfile::Custom:
+        break;
+      case PresetProfile::Auto:
+        break;
+    }
+
+    active_profile_ = requested_profile;
+    if (remember_for_topic && !selected_topic_.empty()) {
+      savePresetForCurrentTopic(requested_profile);
+    }
+  }
+
+  void applyPresetForCurrentTopic() {
+    if (selected_topic_.empty() || selected_type_.empty()) {
+      return;
+    }
+
+    for (const auto &binding : topic_presets_) {
+      if (binding.topic == selected_topic_ && binding.type == selected_type_) {
+        applySettings(binding.settings);
+        active_profile_ = binding.profile;
+        return;
+      }
+    }
+
+    applyPreset(PresetProfile::Auto, false);
+  }
+
   void clearMessages() {
     std::scoped_lock lock(messages_mutex_);
     messages_.clear();
@@ -742,10 +897,12 @@ private:
   bool autoscroll_{true};
   bool paused_{false};
   bool skip_large_arrays_{true};
+  PresetProfile active_profile_{PresetProfile::Auto};
   int throttle_ms_{0};
   int decode_throttle_ms_{250};
   int max_array_items_{64};
   int max_messages_{500};
+  std::vector<TopicPresetBinding> topic_presets_;
 
   std::mutex messages_mutex_;
   std::deque<std::string> messages_;
