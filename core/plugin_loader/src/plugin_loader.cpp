@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Georgy Grigoriev (GitHub: trianmon)
+// SPDX-License-Identifier: Apache-2.0
+
 #include "ros2scope/plugin_loader/plugin_loader.hpp"
 
 #include <algorithm>

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Georgy Grigoriev (GitHub: trianmon)
+// SPDX-License-Identifier: Apache-2.0
+
 #include <cstdint>
 
 #include "ros2scope/plugin_api/core_context.hpp"

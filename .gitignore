@@ -1,0 +1,14 @@
+build/
+cmake-build-*/
+CMakeUserPresets.json
+
+install/
+log/
+
+.vscode/
+.idea/
+
+*.swp
+*.swo
+*~
+.DS_Store
