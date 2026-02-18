@@ -11,8 +11,12 @@
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <imgui.h>
@@ -41,6 +45,51 @@ struct ValueTreeNode {
   std::string name;
   std::string value;
   std::vector<ValueTreeNode> children;
+};
+
+enum class PresetProfile {
+  Auto = 0,
+  Normal = 1,
+  Image = 2,
+  Custom = 3,
+};
+
+struct TopicPresetBinding {
+  struct Settings {
+    int throttle_ms{0};
+    int decode_throttle_ms{250};
+    int max_array_items{64};
+    bool skip_large_arrays{true};
+    int max_messages{500};
+  };
+
+  std::string topic;
+  std::string type;
+  PresetProfile profile;
+  Settings settings;
+};
+
+struct DecodeJob {
+  rclcpp::SerializedMessage message;
+  std::string topic;
+  std::string type;
+  std::uint64_t generation{0};
+  int max_array_items{64};
+  bool skip_large_arrays{true};
+};
+
+struct TopicStreamState {
+  std::string topic;
+  std::string type;
+  std::chrono::steady_clock::time_point last_emit{};
+  std::chrono::steady_clock::time_point last_decode{};
+  std::chrono::steady_clock::time_point last_hz_update{};
+  std::uint64_t total_received{0};
+  std::uint64_t total_decoded{0};
+  std::uint64_t prev_received{0};
+  std::uint64_t prev_decoded{0};
+  double received_hz{0.0};
+  double decoded_hz{0.0};
 };
 
 std::string trim(const std::string &value) {
@@ -79,6 +128,18 @@ void drawValueTreeNode(const ValueTreeNode &node) {
       drawValueTreeNode(child);
     }
     ImGui::TreePop();
+  }
+}
+
+void drawVerticalResizeHandle(const char *id, float &height, float min_height, float max_height) {
+  const float width = ImGui::GetContentRegionAvail().x;
+  ImGui::InvisibleButton(id, ImVec2(width, 6.0f));
+  if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+  }
+  if (ImGui::IsItemActive()) {
+    height += ImGui::GetIO().MouseDelta.y;
+    height = std::clamp(height, min_height, max_height);
   }
 }
 
@@ -214,10 +275,12 @@ public:
   void onLoad(ros2scope::plugin_api::CoreContext *core_context) override {
     core_context_ = core_context;
     last_topic_refresh_ = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+    startDecodeWorker();
   }
 
   void onUnload() override {
-    unsubscribeCurrentTopic();
+    unsubscribeAllTopics();
+    stopDecodeWorker();
     clearMessages();
     prepared_type_.clear();
     serializer_.reset();
@@ -240,6 +303,27 @@ public:
       topics_ = core_context_->ros_bridge->listTopics();
       last_topic_refresh_ = now;
 
+      std::unordered_set<std::string> current_topic_names;
+      current_topic_names.reserve(topics_.size());
+      for (const auto &topic : topics_) {
+        current_topic_names.insert(topic.name);
+      }
+
+      std::vector<std::string> removed_topics;
+      {
+        std::scoped_lock lock(topic_streams_mutex_);
+        for (const auto &[topic_name, state] : topic_streams_) {
+          (void)state;
+          if (!current_topic_names.contains(topic_name)) {
+            removed_topics.push_back(topic_name);
+          }
+        }
+      }
+
+      for (const auto &topic_name : removed_topics) {
+        unsubscribeTopic(topic_name);
+      }
+
       if (!selected_topic_.empty()) {
         bool still_exists = false;
         for (const auto &topic : topics_) {
@@ -249,14 +333,14 @@ public:
           }
         }
         if (!still_exists) {
-          unsubscribeCurrentTopic();
           selected_topic_.clear();
           selected_type_.clear();
-          value_tree_.clear();
-          value_error_.clear();
+          resetDecodePipeline();
         }
       }
     }
+
+    updateTopicHzStats();
 
   }
 
@@ -279,119 +363,161 @@ public:
       last_topic_refresh_ = std::chrono::steady_clock::now();
     }
 
-    ImGui::Separator();
-    ImGui::TextUnformatted("Topic List");
-    ImGui::BeginChild("topic_list", ImVec2(0.0f, 180.0f), true);
-    for (const auto &topic : topics_) {
-      const bool selected = (topic.name == selected_topic_ && topic.type == selected_type_);
+    if (ImGui::CollapsingHeader("Topic List", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::BeginChild("topic_list", ImVec2(0.0f, topic_list_height_), true);
+      for (const auto &topic : topics_) {
+        const bool selected = (topic.name == selected_topic_ && topic.type == selected_type_);
+        bool checked = isTopicSubscribed(topic.name);
 
-      std::ostringstream label;
-      label << topic.name << "  [" << topic.type << "]  pub=" << topic.publishers << " sub=" << topic.subscribers;
-      if (ImGui::Selectable(label.str().c_str(), selected)) {
-        if (selected_topic_ != topic.name || selected_type_ != topic.type) {
-          unsubscribeCurrentTopic();
-          selected_topic_ = topic.name;
-          selected_type_ = topic.type;
-          clearMessages();
-          value_tree_.clear();
-          value_error_.clear();
+        std::string checkbox_id = "##sub_" + topic.name;
+        if (ImGui::Checkbox(checkbox_id.c_str(), &checked)) {
+          if (checked) {
+            subscribeTopic(topic);
+          } else {
+            unsubscribeTopic(topic.name);
+          }
+        }
+        ImGui::SameLine();
+
+        const TopicStreamState state_snapshot = getTopicStreamState(topic.name);
+
+        std::ostringstream label;
+        label << topic.name << "  [" << topic.type << "]  pub=" << topic.publishers << " sub=" << topic.subscribers;
+        if (checked) {
+          label << "  hz=" << std::fixed << std::setprecision(1) << state_snapshot.received_hz;
+        }
+
+        std::string selectable_label = label.str() + "##sel_" + topic.name;
+        if (ImGui::Selectable(selectable_label.c_str(), selected)) {
+          if (selected_topic_ != topic.name || selected_type_ != topic.type) {
+            selected_topic_ = topic.name;
+            selected_type_ = topic.type;
+            applyPresetForCurrentTopic();
+            clearMessages();
+            resetDecodePipeline();
+          }
         }
       }
-    }
-    ImGui::EndChild();
-
-    ImGui::Separator();
-    ImGui::Text("Selected: %s", selected_topic_.empty() ? "<none>" : selected_topic_.c_str());
-    ImGui::Text("Type: %s", selected_type_.empty() ? "<none>" : selected_type_.c_str());
-
-    if (!selected_type_.empty() && selected_type_ != last_schema_type_) {
-      refreshFieldTree();
+      ImGui::EndChild();
+      drawVerticalResizeHandle("topic_list_resize", topic_list_height_, 100.0f, 700.0f);
     }
 
-    ImGui::SameLine();
-    if (ImGui::Button("Refresh fields") && !selected_type_.empty()) {
-      refreshFieldTree();
-    }
+    if (ImGui::CollapsingHeader("Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::Text("Selected: %s", selected_topic_.empty() ? "<none>" : selected_topic_.c_str());
+      ImGui::Text("Type: %s", selected_type_.empty() ? "<none>" : selected_type_.c_str());
 
-    ImGui::SliderInt("Throttle (ms)", &throttle_ms_, 0, 1000);
-    ImGui::SliderInt("Decode throttle (ms)", &decode_throttle_ms_, 0, 2000);
-    ImGui::SliderInt("Max array items", &max_array_items_, 0, 512);
-    ImGui::Checkbox("Autoscroll", &autoscroll_);
-    ImGui::Checkbox("Pause", &paused_);
-    ImGui::SliderInt("Max messages", &max_messages_, 50, 5000);
-
-    if (!selected_topic_.empty() && !subscribed_) {
-      if (ImGui::Button("Subscribe")) {
-        subscribeCurrentTopic();
-      }
-    } else if (subscribed_) {
-      if (ImGui::Button("Unsubscribe")) {
-        unsubscribeCurrentTopic();
-      }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Clear")) {
-      clearMessages();
-    }
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Field Tree");
-    ImGui::BeginChild("field_tree", ImVec2(0.0f, 180.0f), true);
-    if (selected_type_.empty()) {
-      ImGui::TextUnformatted("Select topic to inspect fields.");
-    } else if (!schema_error_.empty()) {
-      ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", schema_error_.c_str());
-    } else if (field_tree_.empty()) {
-      ImGui::TextUnformatted("No fields parsed.");
-    } else {
-      for (const auto &root : field_tree_) {
-        drawFieldTreeNode(root);
-      }
-    }
-    ImGui::EndChild();
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Value Tree");
-    ImGui::BeginChild("value_tree", ImVec2(0.0f, 180.0f), true);
-    std::string local_value_error;
-    std::vector<ValueTreeNode> local_value_tree;
-    {
-      std::scoped_lock lock(value_mutex_);
-      local_value_error = value_error_;
-      local_value_tree = value_tree_;
-    }
-
-    if (selected_topic_.empty()) {
-      ImGui::TextUnformatted("Select topic to inspect values.");
-    } else if (!local_value_error.empty()) {
-      ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", local_value_error.c_str());
-    } else {
-      if (local_value_tree.empty()) {
-        ImGui::TextUnformatted("No decoded values yet. Subscribe and wait for messages.");
-      }
-      for (const auto &root : local_value_tree) {
-        drawValueTreeNode(root);
-      }
-    }
-    ImGui::EndChild();
-
-    ImGui::Separator();
-    ImGui::Text("Received: %llu", static_cast<unsigned long long>(message_counter_.load()));
-    ImGui::SameLine();
-    ImGui::Text("Decoded: %llu", static_cast<unsigned long long>(decoded_counter_.load()));
-
-    ImGui::BeginChild("message_view", ImVec2(0.0f, 0.0f), true);
-    {
-      std::scoped_lock lock(messages_mutex_);
-      for (const auto &line : messages_) {
-        ImGui::TextWrapped("%s", line.c_str());
+      if (!selected_type_.empty() && selected_type_ != last_schema_type_) {
+        refreshFieldTree();
       }
 
-      if (autoscroll_ && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 20.0f) {
-        ImGui::SetScrollHereY(1.0f);
+      if (ImGui::Button("Refresh fields") && !selected_type_.empty()) {
+        refreshFieldTree();
+      }
+
+      ImGui::Separator();
+      ImGui::TextUnformatted("Profile");
+      int profile_index = static_cast<int>(active_profile_);
+      static const char *kProfileLabels[] = {"Auto", "Normal", "Image", "Custom"};
+      if (ImGui::Combo("Preset", &profile_index, kProfileLabels, IM_ARRAYSIZE(kProfileLabels))) {
+        const auto selected_profile = static_cast<PresetProfile>(profile_index);
+        if (selected_profile == PresetProfile::Custom) {
+          active_profile_ = PresetProfile::Custom;
+        } else {
+          applyPreset(selected_profile, false);
+        }
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Apply preset") && active_profile_ != PresetProfile::Custom) {
+        applyPreset(active_profile_, false);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Save for topic") && !selected_topic_.empty()) {
+        savePresetForCurrentTopic(active_profile_);
+      }
+
+      bool settings_changed = false;
+      settings_changed |= ImGui::SliderInt("Throttle (ms)", &throttle_ms_, 0, 1000);
+      settings_changed |= ImGui::SliderInt("Decode throttle (ms)", &decode_throttle_ms_, 0, 2000);
+      settings_changed |= ImGui::SliderInt("Max array items", &max_array_items_, 0, 512);
+      settings_changed |= ImGui::Checkbox("Skip large arrays", &skip_large_arrays_);
+      if (settings_changed) {
+        active_profile_ = PresetProfile::Custom;
+      }
+      ImGui::Checkbox("Autoscroll", &autoscroll_);
+      ImGui::Checkbox("Pause", &paused_);
+      if (ImGui::SliderInt("Max messages", &max_messages_, 50, 5000)) {
+        active_profile_ = PresetProfile::Custom;
+      }
+
+      if (ImGui::Button("Clear")) {
+        clearMessages();
       }
     }
-    ImGui::EndChild();
+
+    if (ImGui::CollapsingHeader("Field Tree", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::BeginChild("field_tree", ImVec2(0.0f, field_tree_height_), true);
+      if (selected_type_.empty()) {
+        ImGui::TextUnformatted("Select topic to inspect fields.");
+      } else if (!schema_error_.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", schema_error_.c_str());
+      } else if (field_tree_.empty()) {
+        ImGui::TextUnformatted("No fields parsed.");
+      } else {
+        for (const auto &root : field_tree_) {
+          drawFieldTreeNode(root);
+        }
+      }
+      ImGui::EndChild();
+      drawVerticalResizeHandle("field_tree_resize", field_tree_height_, 100.0f, 700.0f);
+    }
+
+    if (ImGui::CollapsingHeader("Value Tree", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::BeginChild("value_tree", ImVec2(0.0f, value_tree_height_), true);
+      std::string local_value_error;
+      std::vector<ValueTreeNode> local_value_tree;
+      {
+        std::scoped_lock lock(value_mutex_);
+        local_value_error = value_error_;
+        local_value_tree = value_tree_;
+      }
+
+      if (selected_topic_.empty()) {
+        ImGui::TextUnformatted("Select topic to inspect values.");
+      } else if (!local_value_error.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", local_value_error.c_str());
+      } else {
+        if (local_value_tree.empty()) {
+          ImGui::TextUnformatted("No decoded values yet. Subscribe and wait for messages.");
+        }
+        for (const auto &root : local_value_tree) {
+          drawValueTreeNode(root);
+        }
+      }
+      ImGui::EndChild();
+      drawVerticalResizeHandle("value_tree_resize", value_tree_height_, 100.0f, 700.0f);
+    }
+
+    if (ImGui::CollapsingHeader("Message View", ImGuiTreeNodeFlags_DefaultOpen)) {
+      const TopicStreamState selected_state = getTopicStreamState(selected_topic_);
+      ImGui::Text("Received: %llu", static_cast<unsigned long long>(message_counter_.load()));
+      ImGui::SameLine();
+      ImGui::Text("Decoded: %llu", static_cast<unsigned long long>(decoded_counter_.load()));
+      ImGui::Text("RX Hz: %.1f  Decode Hz: %.1f", selected_state.received_hz, selected_state.decoded_hz);
+
+      ImGui::BeginChild("message_view", ImVec2(0.0f, message_view_height_), true);
+      {
+        std::scoped_lock lock(messages_mutex_);
+        for (const auto &line : messages_) {
+          ImGui::TextWrapped("%s", line.c_str());
+        }
+
+        if (autoscroll_ && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 20.0f) {
+          ImGui::SetScrollHereY(1.0f);
+        }
+      }
+      ImGui::EndChild();
+      drawVerticalResizeHandle("message_view_resize", message_view_height_, 120.0f, 900.0f);
+    }
 
     ImGui::End();
   }
@@ -439,7 +565,9 @@ public:
   ValueTreeNode buildValueNodeFromMember(
       const rosidl_typesupport_introspection_cpp::MessageMember &member,
       const void *field_ptr,
-      const std::string &label) const {
+      const std::string &label,
+      int max_array_items,
+      bool skip_large_arrays) const {
     ValueTreeNode node;
     node.name = label;
 
@@ -450,8 +578,8 @@ public:
       }
 
       node.value = "size=" + std::to_string(item_count);
-      const std::size_t array_limit = static_cast<std::size_t>(std::max(0, max_array_items_));
-      if (item_count > array_limit) {
+      const std::size_t array_limit = static_cast<std::size_t>(std::max(0, max_array_items));
+      if (skip_large_arrays && item_count > array_limit) {
         node.value += ", skipped large array (limit=" + std::to_string(array_limit) + ")";
         return node;
       }
@@ -476,7 +604,12 @@ public:
           for (uint32_t i = 0; i < sub_members->member_count_; ++i) {
             const auto &sub = sub_members->members_[i];
             const auto *sub_ptr = static_cast<const uint8_t *>(item_ptr) + sub.offset_;
-            child.children.push_back(buildValueNodeFromMember(sub, sub_ptr, sub.name_));
+            child.children.push_back(buildValueNodeFromMember(
+                sub,
+                sub_ptr,
+                sub.name_,
+                max_array_items,
+                skip_large_arrays));
           }
           node.children.push_back(std::move(child));
         } else {
@@ -497,7 +630,12 @@ public:
       for (uint32_t i = 0; i < sub_members->member_count_; ++i) {
         const auto &sub = sub_members->members_[i];
         const auto *sub_ptr = static_cast<const uint8_t *>(field_ptr) + sub.offset_;
-        node.children.push_back(buildValueNodeFromMember(sub, sub_ptr, sub.name_));
+        node.children.push_back(buildValueNodeFromMember(
+            sub,
+            sub_ptr,
+            sub.name_,
+            max_array_items,
+            skip_large_arrays));
       }
       return node;
     }
@@ -543,13 +681,68 @@ public:
     return node;
   }
 
-  void updateValueTreeFromSerialized(const rclcpp::SerializedMessage &message) {
-    if (!prepareTypeSupportForSelectedType()) {
+  bool prepareTypeSupportForType(
+      const std::string &type,
+      std::string &error_out,
+      std::string &prepared_type,
+      std::shared_ptr<rcpputils::SharedLibrary> &cpp_typesupport_library,
+      std::shared_ptr<rcpputils::SharedLibrary> &introspection_typesupport_library,
+      const rosidl_message_type_support_t *&cpp_typesupport,
+      const rosidl_message_type_support_t *&introspection_typesupport,
+      std::unique_ptr<rclcpp::SerializationBase> &serializer) {
+    if (type.empty()) {
+      error_out = "Type is empty";
+      return false;
+    }
+
+    if (prepared_type == type && serializer != nullptr && introspection_typesupport != nullptr) {
+      return true;
+    }
+
+    serializer.reset();
+    cpp_typesupport = nullptr;
+    introspection_typesupport = nullptr;
+    cpp_typesupport_library.reset();
+    introspection_typesupport_library.reset();
+    prepared_type.clear();
+
+    try {
+      cpp_typesupport_library = rclcpp::get_typesupport_library(type, "rosidl_typesupport_cpp");
+      cpp_typesupport = rclcpp::get_message_typesupport_handle(type, "rosidl_typesupport_cpp", *cpp_typesupport_library);
+      serializer = std::make_unique<rclcpp::SerializationBase>(cpp_typesupport);
+
+      introspection_typesupport_library =
+          rclcpp::get_typesupport_library(type, "rosidl_typesupport_introspection_cpp");
+      introspection_typesupport =
+          rclcpp::get_message_typesupport_handle(type, "rosidl_typesupport_introspection_cpp", *introspection_typesupport_library);
+
+      prepared_type = type;
+      error_out.clear();
+      return true;
+    } catch (const std::exception &e) {
+      error_out = std::string("Type support error: ") + e.what();
+      return false;
+    }
+  }
+
+  void updateValueTreeFromSerialized(const DecodeJob &job) {
+    std::string prepare_error;
+    if (!prepareTypeSupportForType(
+            job.type,
+            prepare_error,
+            worker_prepared_type_,
+            worker_cpp_typesupport_library_,
+            worker_introspection_typesupport_library_,
+            worker_cpp_typesupport_,
+            worker_introspection_typesupport_,
+            worker_serializer_)) {
+      std::scoped_lock lock(value_mutex_);
+      value_error_ = prepare_error;
       return;
     }
 
-    const auto *message_members =
-        static_cast<const rosidl_typesupport_introspection_cpp::MessageMembers *>(introspection_typesupport_->data);
+    const auto *message_members = static_cast<const rosidl_typesupport_introspection_cpp::MessageMembers *>(
+        worker_introspection_typesupport_->data);
     if (message_members == nullptr) {
       std::scoped_lock lock(value_mutex_);
       value_error_ = "Missing introspection message members";
@@ -561,7 +754,7 @@ public:
     message_members->init_function(message_data.get(), rosidl_runtime_cpp::MessageInitialization::ALL);
 
     try {
-      serializer_->deserialize_message(&message, message_data.get());
+      worker_serializer_->deserialize_message(&job.message, message_data.get());
     } catch (const std::exception &e) {
       message_members->fini_function(message_data.get());
       std::scoped_lock lock(value_mutex_);
@@ -573,11 +766,11 @@ public:
 
     ValueTreeNode meta;
     meta.name = "meta";
-    meta.children.push_back(ValueTreeNode{.name = "topic", .value = selected_topic_});
-    meta.children.push_back(ValueTreeNode{.name = "type", .value = selected_type_});
+    meta.children.push_back(ValueTreeNode{.name = "topic", .value = job.topic});
+    meta.children.push_back(ValueTreeNode{.name = "type", .value = job.type});
     meta.children.push_back(ValueTreeNode{
         .name = "size_bytes",
-        .value = std::to_string(message.get_rcl_serialized_message().buffer_length)});
+        .value = std::to_string(job.message.get_rcl_serialized_message().buffer_length)});
     new_tree.push_back(std::move(meta));
 
     ValueTreeNode root;
@@ -585,7 +778,12 @@ public:
     for (uint32_t i = 0; i < message_members->member_count_; ++i) {
       const auto &member = message_members->members_[i];
       const auto *field_ptr = message_data.get() + member.offset_;
-      root.children.push_back(buildValueNodeFromMember(member, field_ptr, member.name_));
+      root.children.push_back(buildValueNodeFromMember(
+          member,
+          field_ptr,
+          member.name_,
+          job.max_array_items,
+          job.skip_large_arrays));
     }
     new_tree.push_back(std::move(root));
 
@@ -630,6 +828,372 @@ public:
   }
 
 private:
+  TopicStreamState getTopicStreamState(const std::string &topic_name) const {
+    std::scoped_lock lock(topic_streams_mutex_);
+    auto it = topic_streams_.find(topic_name);
+    if (it == topic_streams_.end()) {
+      TopicStreamState empty;
+      empty.topic = topic_name;
+      return empty;
+    }
+    return it->second;
+  }
+
+  bool isTopicSubscribed(const std::string &topic_name) const {
+    std::scoped_lock lock(topic_streams_mutex_);
+    return topic_streams_.find(topic_name) != topic_streams_.end();
+  }
+
+  void updateTopicHzStats() {
+    constexpr auto kHzAveragingWindow = std::chrono::seconds(1);
+    const auto now = std::chrono::steady_clock::now();
+    std::scoped_lock lock(topic_streams_mutex_);
+    for (auto &[topic_name, state] : topic_streams_) {
+      (void)topic_name;
+      if (state.last_hz_update == std::chrono::steady_clock::time_point{}) {
+        state.last_hz_update = now;
+        state.prev_received = state.total_received;
+        state.prev_decoded = state.total_decoded;
+        continue;
+      }
+
+      const auto elapsed = now - state.last_hz_update;
+      if (elapsed < kHzAveragingWindow) {
+        continue;
+      }
+
+      const double seconds = std::chrono::duration<double>(elapsed).count();
+      if (seconds <= 0.0) {
+        continue;
+      }
+
+      const std::uint64_t received_delta = state.total_received - state.prev_received;
+      const std::uint64_t decoded_delta = state.total_decoded - state.prev_decoded;
+
+      state.received_hz = static_cast<double>(received_delta) / seconds;
+      state.decoded_hz = static_cast<double>(decoded_delta) / seconds;
+      state.prev_received = state.total_received;
+      state.prev_decoded = state.total_decoded;
+      state.last_hz_update = now;
+    }
+  }
+
+  bool subscribeTopic(const ros2scope::ros_bridge::TopicInfo &topic) {
+    if (topic.name.empty() || topic.type.empty()) {
+      return false;
+    }
+
+    if (core_context_ == nullptr || core_context_->ros_bridge == nullptr) {
+      return false;
+    }
+
+    if (isTopicSubscribed(topic.name)) {
+      return true;
+    }
+
+    if (core_context_->type_resolver != nullptr) {
+      core_context_->type_resolver->ensureTypeSupportLoaded(topic.type);
+    }
+
+    const bool ok = core_context_->ros_bridge->subscribeGeneric(
+        topic.name,
+        topic.type,
+        [this, topic_name = topic.name, topic_type = topic.type](const rclcpp::SerializedMessage &message) {
+          const auto now = std::chrono::steady_clock::now();
+
+          {
+            std::scoped_lock lock(topic_streams_mutex_);
+            auto it = topic_streams_.find(topic_name);
+            if (it == topic_streams_.end()) {
+              return;
+            }
+            it->second.total_received++;
+          }
+
+          if (topic_name != selected_topic_ || topic_type != selected_type_) {
+            return;
+          }
+
+          if (paused_) {
+            return;
+          }
+
+          bool emit_allowed = true;
+          bool decode_allowed = true;
+          {
+            std::scoped_lock lock(topic_streams_mutex_);
+            auto it = topic_streams_.find(topic_name);
+            if (it == topic_streams_.end()) {
+              return;
+            }
+
+            if (throttle_ms_ > 0 && it->second.last_emit != std::chrono::steady_clock::time_point{} &&
+                now - it->second.last_emit < std::chrono::milliseconds(throttle_ms_)) {
+              emit_allowed = false;
+            } else {
+              it->second.last_emit = now;
+            }
+
+            if (decode_throttle_ms_ > 0 && it->second.last_decode != std::chrono::steady_clock::time_point{} &&
+                now - it->second.last_decode < std::chrono::milliseconds(decode_throttle_ms_)) {
+              decode_allowed = false;
+            } else {
+              it->second.last_decode = now;
+            }
+          }
+
+          if (!emit_allowed) {
+            return;
+          }
+
+          std::ostringstream prefix;
+          prefix << "#" << (message_counter_.load() + 1) << " [" << topic_name << "] ";
+          auto line = prefix.str() + formatSerialized(message);
+
+          {
+            std::scoped_lock lock(messages_mutex_);
+            messages_.push_back(std::move(line));
+            while (messages_.size() > static_cast<std::size_t>(std::max(10, max_messages_))) {
+              messages_.pop_front();
+            }
+          }
+          message_counter_.fetch_add(1);
+
+          if (!decode_allowed) {
+            return;
+          }
+
+          DecodeJob decode_job;
+          decode_job.message = message;
+          decode_job.topic = topic_name;
+          decode_job.type = topic_type;
+          decode_job.generation = decode_generation_.load();
+          decode_job.max_array_items = max_array_items_;
+          decode_job.skip_large_arrays = skip_large_arrays_;
+          enqueueDecodeJob(decode_job);
+        });
+
+    if (!ok) {
+      return false;
+    }
+
+    std::scoped_lock lock(topic_streams_mutex_);
+    TopicStreamState state;
+    state.topic = topic.name;
+    state.type = topic.type;
+    topic_streams_[topic.name] = std::move(state);
+    return true;
+  }
+
+  void unsubscribeTopic(const std::string &topic_name) {
+    if (core_context_ != nullptr && core_context_->ros_bridge != nullptr && !topic_name.empty()) {
+      core_context_->ros_bridge->unsubscribe(topic_name);
+    }
+
+    {
+      std::scoped_lock lock(topic_streams_mutex_);
+      topic_streams_.erase(topic_name);
+    }
+
+    if (topic_name == selected_topic_) {
+      resetDecodePipeline();
+    }
+  }
+
+  void unsubscribeAllTopics() {
+    std::vector<std::string> topic_names;
+    {
+      std::scoped_lock lock(topic_streams_mutex_);
+      topic_names.reserve(topic_streams_.size());
+      for (const auto &[topic_name, state] : topic_streams_) {
+        (void)state;
+        topic_names.push_back(topic_name);
+      }
+    }
+
+    for (const auto &topic_name : topic_names) {
+      unsubscribeTopic(topic_name);
+    }
+  }
+
+  void startDecodeWorker() {
+    stopDecodeWorker();
+    decode_worker_running_ = true;
+    decode_worker_ = std::thread([this]() { decodeWorkerLoop(); });
+  }
+
+  void stopDecodeWorker() {
+    {
+      std::scoped_lock lock(decode_queue_mutex_);
+      decode_worker_running_ = false;
+      decode_queue_.clear();
+    }
+    decode_queue_cv_.notify_all();
+    if (decode_worker_.joinable()) {
+      decode_worker_.join();
+    }
+  }
+
+  void resetDecodePipeline() {
+    decode_generation_.fetch_add(1);
+    {
+      std::scoped_lock queue_lock(decode_queue_mutex_);
+      decode_queue_.clear();
+    }
+    {
+      std::scoped_lock value_lock(value_mutex_);
+      value_tree_.clear();
+      value_error_.clear();
+    }
+  }
+
+  void enqueueDecodeJob(const DecodeJob &job) {
+    {
+      std::scoped_lock lock(decode_queue_mutex_);
+      decode_queue_.push_back(job);
+      while (decode_queue_.size() > max_decode_queue_size_) {
+        decode_queue_.pop_front();
+      }
+    }
+    decode_queue_cv_.notify_one();
+  }
+
+  void decodeWorkerLoop() {
+    while (true) {
+      DecodeJob job;
+      {
+        std::unique_lock lock(decode_queue_mutex_);
+        decode_queue_cv_.wait(lock, [this]() { return !decode_worker_running_ || !decode_queue_.empty(); });
+
+        if (!decode_worker_running_ && decode_queue_.empty()) {
+          return;
+        }
+
+        job = std::move(decode_queue_.front());
+        decode_queue_.pop_front();
+      }
+
+      if (job.generation != decode_generation_.load()) {
+        continue;
+      }
+
+      updateValueTreeFromSerialized(job);
+      if (job.generation == decode_generation_.load()) {
+        decoded_counter_.fetch_add(1);
+        std::scoped_lock lock(topic_streams_mutex_);
+        auto it = topic_streams_.find(job.topic);
+        if (it != topic_streams_.end()) {
+          it->second.total_decoded++;
+        }
+      }
+    }
+  }
+
+  bool looksLikeImageTopic(const std::string &topic_name, const std::string &type_name) const {
+    if (type_name == "sensor_msgs/msg/Image" || type_name == "sensor_msgs/msg/CompressedImage") {
+      return true;
+    }
+
+    const std::string topic_lower = trim(topic_name);
+    return topic_lower.find("image") != std::string::npos || topic_lower.find("camera") != std::string::npos;
+  }
+
+  PresetProfile autoDetectPresetForCurrentTopic() const {
+    if (looksLikeImageTopic(selected_topic_, selected_type_)) {
+      return PresetProfile::Image;
+    }
+    return PresetProfile::Normal;
+  }
+
+  void savePresetForCurrentTopic(PresetProfile profile) {
+    if (selected_topic_.empty() || selected_type_.empty()) {
+      return;
+    }
+
+    TopicPresetBinding::Settings settings;
+    settings.throttle_ms = throttle_ms_;
+    settings.decode_throttle_ms = decode_throttle_ms_;
+    settings.max_array_items = max_array_items_;
+    settings.skip_large_arrays = skip_large_arrays_;
+    settings.max_messages = max_messages_;
+
+    for (auto &binding : topic_presets_) {
+      if (binding.topic == selected_topic_ && binding.type == selected_type_) {
+        binding.profile = profile;
+        binding.settings = settings;
+        return;
+      }
+    }
+
+    topic_presets_.push_back(TopicPresetBinding{
+        .topic = selected_topic_,
+        .type = selected_type_,
+        .profile = profile,
+        .settings = settings,
+    });
+  }
+
+  void applySettings(const TopicPresetBinding::Settings &settings) {
+    throttle_ms_ = settings.throttle_ms;
+    decode_throttle_ms_ = settings.decode_throttle_ms;
+    max_array_items_ = settings.max_array_items;
+    skip_large_arrays_ = settings.skip_large_arrays;
+    max_messages_ = settings.max_messages;
+  }
+
+  void applyPreset(PresetProfile requested_profile, bool remember_for_topic) {
+    PresetProfile resolved_profile = requested_profile;
+    if (requested_profile == PresetProfile::Auto) {
+      resolved_profile = autoDetectPresetForCurrentTopic();
+    }
+
+    switch (resolved_profile) {
+      case PresetProfile::Image:
+        applySettings(TopicPresetBinding::Settings{
+            .throttle_ms = 33,
+            .decode_throttle_ms = 300,
+            .max_array_items = 16,
+            .skip_large_arrays = true,
+            .max_messages = 200,
+        });
+        break;
+      case PresetProfile::Normal:
+        applySettings(TopicPresetBinding::Settings{
+            .throttle_ms = 0,
+            .decode_throttle_ms = 150,
+            .max_array_items = 128,
+            .skip_large_arrays = false,
+            .max_messages = 500,
+        });
+        break;
+      case PresetProfile::Custom:
+        break;
+      case PresetProfile::Auto:
+        break;
+    }
+
+    active_profile_ = requested_profile;
+    if (remember_for_topic && !selected_topic_.empty()) {
+      savePresetForCurrentTopic(requested_profile);
+    }
+  }
+
+  void applyPresetForCurrentTopic() {
+    if (selected_topic_.empty() || selected_type_.empty()) {
+      return;
+    }
+
+    for (const auto &binding : topic_presets_) {
+      if (binding.topic == selected_topic_ && binding.type == selected_type_) {
+        applySettings(binding.settings);
+        active_profile_ = binding.profile;
+        return;
+      }
+    }
+
+    applyPreset(PresetProfile::Auto, false);
+  }
+
   void clearMessages() {
     std::scoped_lock lock(messages_mutex_);
     messages_.clear();
@@ -660,97 +1224,31 @@ private:
     return stream.str();
   }
 
-  void subscribeCurrentTopic() {
-    if (selected_topic_.empty() || selected_type_.empty()) {
-      return;
-    }
-
-    if (core_context_ == nullptr || core_context_->ros_bridge == nullptr) {
-      return;
-    }
-
-    if (core_context_->type_resolver != nullptr) {
-      core_context_->type_resolver->ensureTypeSupportLoaded(selected_type_);
-    }
-
-    prepareTypeSupportForSelectedType();
-
-    last_emit_time_ = std::chrono::steady_clock::time_point{};
-    last_decode_time_ = std::chrono::steady_clock::time_point{};
-    const bool ok = core_context_->ros_bridge->subscribeGeneric(
-        selected_topic_,
-        selected_type_,
-        [this](const rclcpp::SerializedMessage &message) {
-          if (paused_) {
-            return;
-          }
-
-          const int throttle_value = throttle_ms_;
-          const auto now = std::chrono::steady_clock::now();
-          if (throttle_value > 0 && last_emit_time_ != std::chrono::steady_clock::time_point{} &&
-              now - last_emit_time_ < std::chrono::milliseconds(throttle_value)) {
-            return;
-          }
-          last_emit_time_ = now;
-
-          std::ostringstream prefix;
-          prefix << "#" << (message_counter_.load() + 1) << " [" << selected_topic_ << "] ";
-          auto line = prefix.str() + formatSerialized(message);
-
-          {
-            std::scoped_lock lock(messages_mutex_);
-            messages_.push_back(std::move(line));
-            while (messages_.size() > static_cast<std::size_t>(std::max(10, max_messages_))) {
-              messages_.pop_front();
-            }
-          }
-          message_counter_.fetch_add(1);
-
-          const int decode_throttle = decode_throttle_ms_;
-          const auto decode_now = std::chrono::steady_clock::now();
-          if (decode_throttle > 0 && last_decode_time_ != std::chrono::steady_clock::time_point{} &&
-              decode_now - last_decode_time_ < std::chrono::milliseconds(decode_throttle)) {
-            return;
-          }
-
-          last_decode_time_ = decode_now;
-          updateValueTreeFromSerialized(message);
-          decoded_counter_.fetch_add(1);
-        });
-
-    subscribed_ = ok;
-  }
-
-  void unsubscribeCurrentTopic() {
-    if (!subscribed_ || core_context_ == nullptr || core_context_->ros_bridge == nullptr || selected_topic_.empty()) {
-      subscribed_ = false;
-      return;
-    }
-
-    core_context_->ros_bridge->unsubscribe(selected_topic_);
-    subscribed_ = false;
-  }
-
   ros2scope::plugin_api::CoreContext *core_context_{nullptr};
   std::vector<ros2scope::ros_bridge::TopicInfo> topics_;
   std::string selected_topic_;
   std::string selected_type_;
   std::string prepared_type_;
 
-  bool subscribed_{false};
   bool autoscroll_{true};
   bool paused_{false};
+  bool skip_large_arrays_{true};
+  PresetProfile active_profile_{PresetProfile::Auto};
   int throttle_ms_{0};
   int decode_throttle_ms_{250};
   int max_array_items_{64};
   int max_messages_{500};
+  float topic_list_height_{180.0f};
+  float field_tree_height_{180.0f};
+  float value_tree_height_{180.0f};
+  float message_view_height_{240.0f};
+  std::vector<TopicPresetBinding> topic_presets_;
 
   std::mutex messages_mutex_;
   std::deque<std::string> messages_;
   std::atomic<std::uint64_t> message_counter_{0};
   std::atomic<std::uint64_t> decoded_counter_{0};
-  std::chrono::steady_clock::time_point last_emit_time_{};
-  std::chrono::steady_clock::time_point last_decode_time_{};
+  std::atomic<std::uint64_t> decode_generation_{0};
   std::chrono::steady_clock::time_point last_topic_refresh_{};
   std::string last_schema_type_;
   std::string schema_error_;
@@ -759,11 +1257,28 @@ private:
   std::mutex value_mutex_;
   std::vector<ValueTreeNode> value_tree_;
 
+  mutable std::mutex topic_streams_mutex_;
+  std::unordered_map<std::string, TopicStreamState> topic_streams_;
+
+  std::mutex decode_queue_mutex_;
+  std::condition_variable decode_queue_cv_;
+  std::deque<DecodeJob> decode_queue_;
+  std::thread decode_worker_;
+  bool decode_worker_running_{false};
+  std::size_t max_decode_queue_size_{4};
+
   std::shared_ptr<rcpputils::SharedLibrary> cpp_typesupport_library_;
   std::shared_ptr<rcpputils::SharedLibrary> introspection_typesupport_library_;
   const rosidl_message_type_support_t *cpp_typesupport_{nullptr};
   const rosidl_message_type_support_t *introspection_typesupport_{nullptr};
   std::unique_ptr<rclcpp::SerializationBase> serializer_;
+
+  std::string worker_prepared_type_;
+  std::shared_ptr<rcpputils::SharedLibrary> worker_cpp_typesupport_library_;
+  std::shared_ptr<rcpputils::SharedLibrary> worker_introspection_typesupport_library_;
+  const rosidl_message_type_support_t *worker_cpp_typesupport_{nullptr};
+  const rosidl_message_type_support_t *worker_introspection_typesupport_{nullptr};
+  std::unique_ptr<rclcpp::SerializationBase> worker_serializer_;
 };
 
 }  // namespace
