@@ -11,8 +11,10 @@
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <imgui.h>
@@ -63,6 +65,15 @@ struct TopicPresetBinding {
   std::string type;
   PresetProfile profile;
   Settings settings;
+};
+
+struct DecodeJob {
+  rclcpp::SerializedMessage message;
+  std::string topic;
+  std::string type;
+  std::uint64_t generation{0};
+  int max_array_items{64};
+  bool skip_large_arrays{true};
 };
 
 std::string trim(const std::string &value) {
@@ -248,10 +259,12 @@ public:
   void onLoad(ros2scope::plugin_api::CoreContext *core_context) override {
     core_context_ = core_context;
     last_topic_refresh_ = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+    startDecodeWorker();
   }
 
   void onUnload() override {
     unsubscribeCurrentTopic();
+    stopDecodeWorker();
     clearMessages();
     prepared_type_.clear();
     serializer_.reset();
@@ -286,8 +299,7 @@ public:
           unsubscribeCurrentTopic();
           selected_topic_.clear();
           selected_type_.clear();
-          value_tree_.clear();
-          value_error_.clear();
+          resetDecodePipeline();
         }
       }
     }
@@ -327,8 +339,7 @@ public:
             selected_type_ = topic.type;
             applyPresetForCurrentTopic();
             clearMessages();
-            value_tree_.clear();
-            value_error_.clear();
+            resetDecodePipeline();
           }
         }
       }
@@ -507,7 +518,9 @@ public:
   ValueTreeNode buildValueNodeFromMember(
       const rosidl_typesupport_introspection_cpp::MessageMember &member,
       const void *field_ptr,
-      const std::string &label) const {
+      const std::string &label,
+      int max_array_items,
+      bool skip_large_arrays) const {
     ValueTreeNode node;
     node.name = label;
 
@@ -518,8 +531,8 @@ public:
       }
 
       node.value = "size=" + std::to_string(item_count);
-      const std::size_t array_limit = static_cast<std::size_t>(std::max(0, max_array_items_));
-      if (skip_large_arrays_ && item_count > array_limit) {
+      const std::size_t array_limit = static_cast<std::size_t>(std::max(0, max_array_items));
+      if (skip_large_arrays && item_count > array_limit) {
         node.value += ", skipped large array (limit=" + std::to_string(array_limit) + ")";
         return node;
       }
@@ -544,7 +557,12 @@ public:
           for (uint32_t i = 0; i < sub_members->member_count_; ++i) {
             const auto &sub = sub_members->members_[i];
             const auto *sub_ptr = static_cast<const uint8_t *>(item_ptr) + sub.offset_;
-            child.children.push_back(buildValueNodeFromMember(sub, sub_ptr, sub.name_));
+            child.children.push_back(buildValueNodeFromMember(
+                sub,
+                sub_ptr,
+                sub.name_,
+                max_array_items,
+                skip_large_arrays));
           }
           node.children.push_back(std::move(child));
         } else {
@@ -565,7 +583,12 @@ public:
       for (uint32_t i = 0; i < sub_members->member_count_; ++i) {
         const auto &sub = sub_members->members_[i];
         const auto *sub_ptr = static_cast<const uint8_t *>(field_ptr) + sub.offset_;
-        node.children.push_back(buildValueNodeFromMember(sub, sub_ptr, sub.name_));
+        node.children.push_back(buildValueNodeFromMember(
+            sub,
+            sub_ptr,
+            sub.name_,
+            max_array_items,
+            skip_large_arrays));
       }
       return node;
     }
@@ -611,13 +634,68 @@ public:
     return node;
   }
 
-  void updateValueTreeFromSerialized(const rclcpp::SerializedMessage &message) {
-    if (!prepareTypeSupportForSelectedType()) {
+  bool prepareTypeSupportForType(
+      const std::string &type,
+      std::string &error_out,
+      std::string &prepared_type,
+      std::shared_ptr<rcpputils::SharedLibrary> &cpp_typesupport_library,
+      std::shared_ptr<rcpputils::SharedLibrary> &introspection_typesupport_library,
+      const rosidl_message_type_support_t *&cpp_typesupport,
+      const rosidl_message_type_support_t *&introspection_typesupport,
+      std::unique_ptr<rclcpp::SerializationBase> &serializer) {
+    if (type.empty()) {
+      error_out = "Type is empty";
+      return false;
+    }
+
+    if (prepared_type == type && serializer != nullptr && introspection_typesupport != nullptr) {
+      return true;
+    }
+
+    serializer.reset();
+    cpp_typesupport = nullptr;
+    introspection_typesupport = nullptr;
+    cpp_typesupport_library.reset();
+    introspection_typesupport_library.reset();
+    prepared_type.clear();
+
+    try {
+      cpp_typesupport_library = rclcpp::get_typesupport_library(type, "rosidl_typesupport_cpp");
+      cpp_typesupport = rclcpp::get_message_typesupport_handle(type, "rosidl_typesupport_cpp", *cpp_typesupport_library);
+      serializer = std::make_unique<rclcpp::SerializationBase>(cpp_typesupport);
+
+      introspection_typesupport_library =
+          rclcpp::get_typesupport_library(type, "rosidl_typesupport_introspection_cpp");
+      introspection_typesupport =
+          rclcpp::get_message_typesupport_handle(type, "rosidl_typesupport_introspection_cpp", *introspection_typesupport_library);
+
+      prepared_type = type;
+      error_out.clear();
+      return true;
+    } catch (const std::exception &e) {
+      error_out = std::string("Type support error: ") + e.what();
+      return false;
+    }
+  }
+
+  void updateValueTreeFromSerialized(const DecodeJob &job) {
+    std::string prepare_error;
+    if (!prepareTypeSupportForType(
+            job.type,
+            prepare_error,
+            worker_prepared_type_,
+            worker_cpp_typesupport_library_,
+            worker_introspection_typesupport_library_,
+            worker_cpp_typesupport_,
+            worker_introspection_typesupport_,
+            worker_serializer_)) {
+      std::scoped_lock lock(value_mutex_);
+      value_error_ = prepare_error;
       return;
     }
 
-    const auto *message_members =
-        static_cast<const rosidl_typesupport_introspection_cpp::MessageMembers *>(introspection_typesupport_->data);
+    const auto *message_members = static_cast<const rosidl_typesupport_introspection_cpp::MessageMembers *>(
+        worker_introspection_typesupport_->data);
     if (message_members == nullptr) {
       std::scoped_lock lock(value_mutex_);
       value_error_ = "Missing introspection message members";
@@ -629,7 +707,7 @@ public:
     message_members->init_function(message_data.get(), rosidl_runtime_cpp::MessageInitialization::ALL);
 
     try {
-      serializer_->deserialize_message(&message, message_data.get());
+      worker_serializer_->deserialize_message(&job.message, message_data.get());
     } catch (const std::exception &e) {
       message_members->fini_function(message_data.get());
       std::scoped_lock lock(value_mutex_);
@@ -641,11 +719,11 @@ public:
 
     ValueTreeNode meta;
     meta.name = "meta";
-    meta.children.push_back(ValueTreeNode{.name = "topic", .value = selected_topic_});
-    meta.children.push_back(ValueTreeNode{.name = "type", .value = selected_type_});
+    meta.children.push_back(ValueTreeNode{.name = "topic", .value = job.topic});
+    meta.children.push_back(ValueTreeNode{.name = "type", .value = job.type});
     meta.children.push_back(ValueTreeNode{
         .name = "size_bytes",
-        .value = std::to_string(message.get_rcl_serialized_message().buffer_length)});
+        .value = std::to_string(job.message.get_rcl_serialized_message().buffer_length)});
     new_tree.push_back(std::move(meta));
 
     ValueTreeNode root;
@@ -653,7 +731,12 @@ public:
     for (uint32_t i = 0; i < message_members->member_count_; ++i) {
       const auto &member = message_members->members_[i];
       const auto *field_ptr = message_data.get() + member.offset_;
-      root.children.push_back(buildValueNodeFromMember(member, field_ptr, member.name_));
+      root.children.push_back(buildValueNodeFromMember(
+          member,
+          field_ptr,
+          member.name_,
+          job.max_array_items,
+          job.skip_large_arrays));
     }
     new_tree.push_back(std::move(root));
 
@@ -698,6 +781,74 @@ public:
   }
 
 private:
+  void startDecodeWorker() {
+    stopDecodeWorker();
+    decode_worker_running_ = true;
+    decode_worker_ = std::thread([this]() { decodeWorkerLoop(); });
+  }
+
+  void stopDecodeWorker() {
+    {
+      std::scoped_lock lock(decode_queue_mutex_);
+      decode_worker_running_ = false;
+      decode_queue_.clear();
+    }
+    decode_queue_cv_.notify_all();
+    if (decode_worker_.joinable()) {
+      decode_worker_.join();
+    }
+  }
+
+  void resetDecodePipeline() {
+    decode_generation_.fetch_add(1);
+    {
+      std::scoped_lock queue_lock(decode_queue_mutex_);
+      decode_queue_.clear();
+    }
+    {
+      std::scoped_lock value_lock(value_mutex_);
+      value_tree_.clear();
+      value_error_.clear();
+    }
+  }
+
+  void enqueueDecodeJob(const DecodeJob &job) {
+    {
+      std::scoped_lock lock(decode_queue_mutex_);
+      decode_queue_.push_back(job);
+      while (decode_queue_.size() > max_decode_queue_size_) {
+        decode_queue_.pop_front();
+      }
+    }
+    decode_queue_cv_.notify_one();
+  }
+
+  void decodeWorkerLoop() {
+    while (true) {
+      DecodeJob job;
+      {
+        std::unique_lock lock(decode_queue_mutex_);
+        decode_queue_cv_.wait(lock, [this]() { return !decode_worker_running_ || !decode_queue_.empty(); });
+
+        if (!decode_worker_running_ && decode_queue_.empty()) {
+          return;
+        }
+
+        job = std::move(decode_queue_.front());
+        decode_queue_.pop_front();
+      }
+
+      if (job.generation != decode_generation_.load()) {
+        continue;
+      }
+
+      updateValueTreeFromSerialized(job);
+      if (job.generation == decode_generation_.load()) {
+        decoded_counter_.fetch_add(1);
+      }
+    }
+  }
+
   bool looksLikeImageTopic(const std::string &topic_name, const std::string &type_name) const {
     if (type_name == "sensor_msgs/msg/Image" || type_name == "sensor_msgs/msg/CompressedImage") {
       return true;
@@ -847,6 +998,7 @@ private:
     }
 
     prepareTypeSupportForSelectedType();
+    resetDecodePipeline();
 
     last_emit_time_ = std::chrono::steady_clock::time_point{};
     last_decode_time_ = std::chrono::steady_clock::time_point{};
@@ -887,8 +1039,14 @@ private:
           }
 
           last_decode_time_ = decode_now;
-          updateValueTreeFromSerialized(message);
-          decoded_counter_.fetch_add(1);
+          DecodeJob decode_job;
+          decode_job.message = message;
+          decode_job.topic = selected_topic_;
+          decode_job.type = selected_type_;
+          decode_job.generation = decode_generation_.load();
+          decode_job.max_array_items = max_array_items_;
+          decode_job.skip_large_arrays = skip_large_arrays_;
+          enqueueDecodeJob(decode_job);
         });
 
     subscribed_ = ok;
@@ -897,11 +1055,13 @@ private:
   void unsubscribeCurrentTopic() {
     if (!subscribed_ || core_context_ == nullptr || core_context_->ros_bridge == nullptr || selected_topic_.empty()) {
       subscribed_ = false;
+      resetDecodePipeline();
       return;
     }
 
     core_context_->ros_bridge->unsubscribe(selected_topic_);
     subscribed_ = false;
+    resetDecodePipeline();
   }
 
   ros2scope::plugin_api::CoreContext *core_context_{nullptr};
@@ -929,6 +1089,7 @@ private:
   std::deque<std::string> messages_;
   std::atomic<std::uint64_t> message_counter_{0};
   std::atomic<std::uint64_t> decoded_counter_{0};
+  std::atomic<std::uint64_t> decode_generation_{0};
   std::chrono::steady_clock::time_point last_emit_time_{};
   std::chrono::steady_clock::time_point last_decode_time_{};
   std::chrono::steady_clock::time_point last_topic_refresh_{};
@@ -939,11 +1100,25 @@ private:
   std::mutex value_mutex_;
   std::vector<ValueTreeNode> value_tree_;
 
+  std::mutex decode_queue_mutex_;
+  std::condition_variable decode_queue_cv_;
+  std::deque<DecodeJob> decode_queue_;
+  std::thread decode_worker_;
+  bool decode_worker_running_{false};
+  std::size_t max_decode_queue_size_{4};
+
   std::shared_ptr<rcpputils::SharedLibrary> cpp_typesupport_library_;
   std::shared_ptr<rcpputils::SharedLibrary> introspection_typesupport_library_;
   const rosidl_message_type_support_t *cpp_typesupport_{nullptr};
   const rosidl_message_type_support_t *introspection_typesupport_{nullptr};
   std::unique_ptr<rclcpp::SerializationBase> serializer_;
+
+  std::string worker_prepared_type_;
+  std::shared_ptr<rcpputils::SharedLibrary> worker_cpp_typesupport_library_;
+  std::shared_ptr<rcpputils::SharedLibrary> worker_introspection_typesupport_library_;
+  const rosidl_message_type_support_t *worker_cpp_typesupport_{nullptr};
+  const rosidl_message_type_support_t *worker_introspection_typesupport_{nullptr};
+  std::unique_ptr<rclcpp::SerializationBase> worker_serializer_;
 };
 
 }  // namespace
