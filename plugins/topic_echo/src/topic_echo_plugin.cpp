@@ -15,6 +15,8 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <imgui.h>
@@ -74,6 +76,20 @@ struct DecodeJob {
   std::uint64_t generation{0};
   int max_array_items{64};
   bool skip_large_arrays{true};
+};
+
+struct TopicStreamState {
+  std::string topic;
+  std::string type;
+  std::chrono::steady_clock::time_point last_emit{};
+  std::chrono::steady_clock::time_point last_decode{};
+  std::chrono::steady_clock::time_point last_hz_update{};
+  std::uint64_t total_received{0};
+  std::uint64_t total_decoded{0};
+  std::uint64_t prev_received{0};
+  std::uint64_t prev_decoded{0};
+  double received_hz{0.0};
+  double decoded_hz{0.0};
 };
 
 std::string trim(const std::string &value) {
@@ -263,7 +279,7 @@ public:
   }
 
   void onUnload() override {
-    unsubscribeCurrentTopic();
+    unsubscribeAllTopics();
     stopDecodeWorker();
     clearMessages();
     prepared_type_.clear();
@@ -287,6 +303,27 @@ public:
       topics_ = core_context_->ros_bridge->listTopics();
       last_topic_refresh_ = now;
 
+      std::unordered_set<std::string> current_topic_names;
+      current_topic_names.reserve(topics_.size());
+      for (const auto &topic : topics_) {
+        current_topic_names.insert(topic.name);
+      }
+
+      std::vector<std::string> removed_topics;
+      {
+        std::scoped_lock lock(topic_streams_mutex_);
+        for (const auto &[topic_name, state] : topic_streams_) {
+          (void)state;
+          if (!current_topic_names.contains(topic_name)) {
+            removed_topics.push_back(topic_name);
+          }
+        }
+      }
+
+      for (const auto &topic_name : removed_topics) {
+        unsubscribeTopic(topic_name);
+      }
+
       if (!selected_topic_.empty()) {
         bool still_exists = false;
         for (const auto &topic : topics_) {
@@ -296,13 +333,14 @@ public:
           }
         }
         if (!still_exists) {
-          unsubscribeCurrentTopic();
           selected_topic_.clear();
           selected_type_.clear();
           resetDecodePipeline();
         }
       }
     }
+
+    updateTopicHzStats();
 
   }
 
@@ -329,12 +367,29 @@ public:
       ImGui::BeginChild("topic_list", ImVec2(0.0f, topic_list_height_), true);
       for (const auto &topic : topics_) {
         const bool selected = (topic.name == selected_topic_ && topic.type == selected_type_);
+        bool checked = isTopicSubscribed(topic.name);
+
+        std::string checkbox_id = "##sub_" + topic.name;
+        if (ImGui::Checkbox(checkbox_id.c_str(), &checked)) {
+          if (checked) {
+            subscribeTopic(topic);
+          } else {
+            unsubscribeTopic(topic.name);
+          }
+        }
+        ImGui::SameLine();
+
+        const TopicStreamState state_snapshot = getTopicStreamState(topic.name);
 
         std::ostringstream label;
         label << topic.name << "  [" << topic.type << "]  pub=" << topic.publishers << " sub=" << topic.subscribers;
-        if (ImGui::Selectable(label.str().c_str(), selected)) {
+        if (checked) {
+          label << "  hz=" << std::fixed << std::setprecision(1) << state_snapshot.received_hz;
+        }
+
+        std::string selectable_label = label.str() + "##sel_" + topic.name;
+        if (ImGui::Selectable(selectable_label.c_str(), selected)) {
           if (selected_topic_ != topic.name || selected_type_ != topic.type) {
-            unsubscribeCurrentTopic();
             selected_topic_ = topic.name;
             selected_type_ = topic.type;
             applyPresetForCurrentTopic();
@@ -394,16 +449,6 @@ public:
         active_profile_ = PresetProfile::Custom;
       }
 
-      if (!selected_topic_.empty() && !subscribed_) {
-        if (ImGui::Button("Subscribe")) {
-          subscribeCurrentTopic();
-        }
-      } else if (subscribed_) {
-        if (ImGui::Button("Unsubscribe")) {
-          unsubscribeCurrentTopic();
-        }
-      }
-      ImGui::SameLine();
       if (ImGui::Button("Clear")) {
         clearMessages();
       }
@@ -453,9 +498,11 @@ public:
     }
 
     if (ImGui::CollapsingHeader("Message View", ImGuiTreeNodeFlags_DefaultOpen)) {
+      const TopicStreamState selected_state = getTopicStreamState(selected_topic_);
       ImGui::Text("Received: %llu", static_cast<unsigned long long>(message_counter_.load()));
       ImGui::SameLine();
       ImGui::Text("Decoded: %llu", static_cast<unsigned long long>(decoded_counter_.load()));
+      ImGui::Text("RX Hz: %.1f  Decode Hz: %.1f", selected_state.received_hz, selected_state.decoded_hz);
 
       ImGui::BeginChild("message_view", ImVec2(0.0f, message_view_height_), true);
       {
@@ -781,6 +828,194 @@ public:
   }
 
 private:
+  TopicStreamState getTopicStreamState(const std::string &topic_name) const {
+    std::scoped_lock lock(topic_streams_mutex_);
+    auto it = topic_streams_.find(topic_name);
+    if (it == topic_streams_.end()) {
+      TopicStreamState empty;
+      empty.topic = topic_name;
+      return empty;
+    }
+    return it->second;
+  }
+
+  bool isTopicSubscribed(const std::string &topic_name) const {
+    std::scoped_lock lock(topic_streams_mutex_);
+    return topic_streams_.find(topic_name) != topic_streams_.end();
+  }
+
+  void updateTopicHzStats() {
+    constexpr auto kHzAveragingWindow = std::chrono::seconds(1);
+    const auto now = std::chrono::steady_clock::now();
+    std::scoped_lock lock(topic_streams_mutex_);
+    for (auto &[topic_name, state] : topic_streams_) {
+      (void)topic_name;
+      if (state.last_hz_update == std::chrono::steady_clock::time_point{}) {
+        state.last_hz_update = now;
+        state.prev_received = state.total_received;
+        state.prev_decoded = state.total_decoded;
+        continue;
+      }
+
+      const auto elapsed = now - state.last_hz_update;
+      if (elapsed < kHzAveragingWindow) {
+        continue;
+      }
+
+      const double seconds = std::chrono::duration<double>(elapsed).count();
+      if (seconds <= 0.0) {
+        continue;
+      }
+
+      const std::uint64_t received_delta = state.total_received - state.prev_received;
+      const std::uint64_t decoded_delta = state.total_decoded - state.prev_decoded;
+
+      state.received_hz = static_cast<double>(received_delta) / seconds;
+      state.decoded_hz = static_cast<double>(decoded_delta) / seconds;
+      state.prev_received = state.total_received;
+      state.prev_decoded = state.total_decoded;
+      state.last_hz_update = now;
+    }
+  }
+
+  bool subscribeTopic(const ros2scope::ros_bridge::TopicInfo &topic) {
+    if (topic.name.empty() || topic.type.empty()) {
+      return false;
+    }
+
+    if (core_context_ == nullptr || core_context_->ros_bridge == nullptr) {
+      return false;
+    }
+
+    if (isTopicSubscribed(topic.name)) {
+      return true;
+    }
+
+    if (core_context_->type_resolver != nullptr) {
+      core_context_->type_resolver->ensureTypeSupportLoaded(topic.type);
+    }
+
+    const bool ok = core_context_->ros_bridge->subscribeGeneric(
+        topic.name,
+        topic.type,
+        [this, topic_name = topic.name, topic_type = topic.type](const rclcpp::SerializedMessage &message) {
+          const auto now = std::chrono::steady_clock::now();
+
+          {
+            std::scoped_lock lock(topic_streams_mutex_);
+            auto it = topic_streams_.find(topic_name);
+            if (it == topic_streams_.end()) {
+              return;
+            }
+            it->second.total_received++;
+          }
+
+          if (topic_name != selected_topic_ || topic_type != selected_type_) {
+            return;
+          }
+
+          if (paused_) {
+            return;
+          }
+
+          bool emit_allowed = true;
+          bool decode_allowed = true;
+          {
+            std::scoped_lock lock(topic_streams_mutex_);
+            auto it = topic_streams_.find(topic_name);
+            if (it == topic_streams_.end()) {
+              return;
+            }
+
+            if (throttle_ms_ > 0 && it->second.last_emit != std::chrono::steady_clock::time_point{} &&
+                now - it->second.last_emit < std::chrono::milliseconds(throttle_ms_)) {
+              emit_allowed = false;
+            } else {
+              it->second.last_emit = now;
+            }
+
+            if (decode_throttle_ms_ > 0 && it->second.last_decode != std::chrono::steady_clock::time_point{} &&
+                now - it->second.last_decode < std::chrono::milliseconds(decode_throttle_ms_)) {
+              decode_allowed = false;
+            } else {
+              it->second.last_decode = now;
+            }
+          }
+
+          if (!emit_allowed) {
+            return;
+          }
+
+          std::ostringstream prefix;
+          prefix << "#" << (message_counter_.load() + 1) << " [" << topic_name << "] ";
+          auto line = prefix.str() + formatSerialized(message);
+
+          {
+            std::scoped_lock lock(messages_mutex_);
+            messages_.push_back(std::move(line));
+            while (messages_.size() > static_cast<std::size_t>(std::max(10, max_messages_))) {
+              messages_.pop_front();
+            }
+          }
+          message_counter_.fetch_add(1);
+
+          if (!decode_allowed) {
+            return;
+          }
+
+          DecodeJob decode_job;
+          decode_job.message = message;
+          decode_job.topic = topic_name;
+          decode_job.type = topic_type;
+          decode_job.generation = decode_generation_.load();
+          decode_job.max_array_items = max_array_items_;
+          decode_job.skip_large_arrays = skip_large_arrays_;
+          enqueueDecodeJob(decode_job);
+        });
+
+    if (!ok) {
+      return false;
+    }
+
+    std::scoped_lock lock(topic_streams_mutex_);
+    TopicStreamState state;
+    state.topic = topic.name;
+    state.type = topic.type;
+    topic_streams_[topic.name] = std::move(state);
+    return true;
+  }
+
+  void unsubscribeTopic(const std::string &topic_name) {
+    if (core_context_ != nullptr && core_context_->ros_bridge != nullptr && !topic_name.empty()) {
+      core_context_->ros_bridge->unsubscribe(topic_name);
+    }
+
+    {
+      std::scoped_lock lock(topic_streams_mutex_);
+      topic_streams_.erase(topic_name);
+    }
+
+    if (topic_name == selected_topic_) {
+      resetDecodePipeline();
+    }
+  }
+
+  void unsubscribeAllTopics() {
+    std::vector<std::string> topic_names;
+    {
+      std::scoped_lock lock(topic_streams_mutex_);
+      topic_names.reserve(topic_streams_.size());
+      for (const auto &[topic_name, state] : topic_streams_) {
+        (void)state;
+        topic_names.push_back(topic_name);
+      }
+    }
+
+    for (const auto &topic_name : topic_names) {
+      unsubscribeTopic(topic_name);
+    }
+  }
+
   void startDecodeWorker() {
     stopDecodeWorker();
     decode_worker_running_ = true;
@@ -845,6 +1080,11 @@ private:
       updateValueTreeFromSerialized(job);
       if (job.generation == decode_generation_.load()) {
         decoded_counter_.fetch_add(1);
+        std::scoped_lock lock(topic_streams_mutex_);
+        auto it = topic_streams_.find(job.topic);
+        if (it != topic_streams_.end()) {
+          it->second.total_decoded++;
+        }
       }
     }
   }
@@ -984,93 +1224,12 @@ private:
     return stream.str();
   }
 
-  void subscribeCurrentTopic() {
-    if (selected_topic_.empty() || selected_type_.empty()) {
-      return;
-    }
-
-    if (core_context_ == nullptr || core_context_->ros_bridge == nullptr) {
-      return;
-    }
-
-    if (core_context_->type_resolver != nullptr) {
-      core_context_->type_resolver->ensureTypeSupportLoaded(selected_type_);
-    }
-
-    prepareTypeSupportForSelectedType();
-    resetDecodePipeline();
-
-    last_emit_time_ = std::chrono::steady_clock::time_point{};
-    last_decode_time_ = std::chrono::steady_clock::time_point{};
-    const bool ok = core_context_->ros_bridge->subscribeGeneric(
-        selected_topic_,
-        selected_type_,
-        [this](const rclcpp::SerializedMessage &message) {
-          if (paused_) {
-            return;
-          }
-
-          const int throttle_value = throttle_ms_;
-          const auto now = std::chrono::steady_clock::now();
-          if (throttle_value > 0 && last_emit_time_ != std::chrono::steady_clock::time_point{} &&
-              now - last_emit_time_ < std::chrono::milliseconds(throttle_value)) {
-            return;
-          }
-          last_emit_time_ = now;
-
-          std::ostringstream prefix;
-          prefix << "#" << (message_counter_.load() + 1) << " [" << selected_topic_ << "] ";
-          auto line = prefix.str() + formatSerialized(message);
-
-          {
-            std::scoped_lock lock(messages_mutex_);
-            messages_.push_back(std::move(line));
-            while (messages_.size() > static_cast<std::size_t>(std::max(10, max_messages_))) {
-              messages_.pop_front();
-            }
-          }
-          message_counter_.fetch_add(1);
-
-          const int decode_throttle = decode_throttle_ms_;
-          const auto decode_now = std::chrono::steady_clock::now();
-          if (decode_throttle > 0 && last_decode_time_ != std::chrono::steady_clock::time_point{} &&
-              decode_now - last_decode_time_ < std::chrono::milliseconds(decode_throttle)) {
-            return;
-          }
-
-          last_decode_time_ = decode_now;
-          DecodeJob decode_job;
-          decode_job.message = message;
-          decode_job.topic = selected_topic_;
-          decode_job.type = selected_type_;
-          decode_job.generation = decode_generation_.load();
-          decode_job.max_array_items = max_array_items_;
-          decode_job.skip_large_arrays = skip_large_arrays_;
-          enqueueDecodeJob(decode_job);
-        });
-
-    subscribed_ = ok;
-  }
-
-  void unsubscribeCurrentTopic() {
-    if (!subscribed_ || core_context_ == nullptr || core_context_->ros_bridge == nullptr || selected_topic_.empty()) {
-      subscribed_ = false;
-      resetDecodePipeline();
-      return;
-    }
-
-    core_context_->ros_bridge->unsubscribe(selected_topic_);
-    subscribed_ = false;
-    resetDecodePipeline();
-  }
-
   ros2scope::plugin_api::CoreContext *core_context_{nullptr};
   std::vector<ros2scope::ros_bridge::TopicInfo> topics_;
   std::string selected_topic_;
   std::string selected_type_;
   std::string prepared_type_;
 
-  bool subscribed_{false};
   bool autoscroll_{true};
   bool paused_{false};
   bool skip_large_arrays_{true};
@@ -1090,8 +1249,6 @@ private:
   std::atomic<std::uint64_t> message_counter_{0};
   std::atomic<std::uint64_t> decoded_counter_{0};
   std::atomic<std::uint64_t> decode_generation_{0};
-  std::chrono::steady_clock::time_point last_emit_time_{};
-  std::chrono::steady_clock::time_point last_decode_time_{};
   std::chrono::steady_clock::time_point last_topic_refresh_{};
   std::string last_schema_type_;
   std::string schema_error_;
@@ -1099,6 +1256,9 @@ private:
   std::string value_error_;
   std::mutex value_mutex_;
   std::vector<ValueTreeNode> value_tree_;
+
+  mutable std::mutex topic_streams_mutex_;
+  std::unordered_map<std::string, TopicStreamState> topic_streams_;
 
   std::mutex decode_queue_mutex_;
   std::condition_variable decode_queue_cv_;
