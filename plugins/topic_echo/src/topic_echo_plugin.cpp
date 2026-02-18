@@ -316,6 +316,7 @@ public:
     ImGui::SliderInt("Throttle (ms)", &throttle_ms_, 0, 1000);
     ImGui::SliderInt("Decode throttle (ms)", &decode_throttle_ms_, 0, 2000);
     ImGui::SliderInt("Max array items", &max_array_items_, 0, 512);
+    ImGui::Checkbox("Skip large arrays", &skip_large_arrays_);
     ImGui::Checkbox("Autoscroll", &autoscroll_);
     ImGui::Checkbox("Pause", &paused_);
     ImGui::SliderInt("Max messages", &max_messages_, 50, 5000);
@@ -451,7 +452,7 @@ public:
 
       node.value = "size=" + std::to_string(item_count);
       const std::size_t array_limit = static_cast<std::size_t>(std::max(0, max_array_items_));
-      if (item_count > array_limit) {
+      if (skip_large_arrays_ && item_count > array_limit) {
         node.value += ", skipped large array (limit=" + std::to_string(array_limit) + ")";
         return node;
       }
@@ -740,6 +741,7 @@ private:
   bool subscribed_{false};
   bool autoscroll_{true};
   bool paused_{false};
+  bool skip_large_arrays_{true};
   int throttle_ms_{0};
   int decode_throttle_ms_{250};
   int max_array_items_{64};
