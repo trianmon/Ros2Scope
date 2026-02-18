@@ -104,6 +104,18 @@ void drawValueTreeNode(const ValueTreeNode &node) {
   }
 }
 
+void drawVerticalResizeHandle(const char *id, float &height, float min_height, float max_height) {
+  const float width = ImGui::GetContentRegionAvail().x;
+  ImGui::InvisibleButton(id, ImVec2(width, 6.0f));
+  if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+  }
+  if (ImGui::IsItemActive()) {
+    height += ImGui::GetIO().MouseDelta.y;
+    height = std::clamp(height, min_height, max_height);
+  }
+}
+
 std::string scalarToString(uint8_t type_id, const void *data) {
   std::ostringstream stream;
 
@@ -301,148 +313,153 @@ public:
       last_topic_refresh_ = std::chrono::steady_clock::now();
     }
 
-    ImGui::Separator();
-    ImGui::TextUnformatted("Topic List");
-    ImGui::BeginChild("topic_list", ImVec2(0.0f, 180.0f), true);
-    for (const auto &topic : topics_) {
-      const bool selected = (topic.name == selected_topic_ && topic.type == selected_type_);
+    if (ImGui::CollapsingHeader("Topic List", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::BeginChild("topic_list", ImVec2(0.0f, topic_list_height_), true);
+      for (const auto &topic : topics_) {
+        const bool selected = (topic.name == selected_topic_ && topic.type == selected_type_);
 
-      std::ostringstream label;
-      label << topic.name << "  [" << topic.type << "]  pub=" << topic.publishers << " sub=" << topic.subscribers;
-      if (ImGui::Selectable(label.str().c_str(), selected)) {
-        if (selected_topic_ != topic.name || selected_type_ != topic.type) {
-          unsubscribeCurrentTopic();
-          selected_topic_ = topic.name;
-          selected_type_ = topic.type;
-          applyPresetForCurrentTopic();
-          clearMessages();
-          value_tree_.clear();
-          value_error_.clear();
+        std::ostringstream label;
+        label << topic.name << "  [" << topic.type << "]  pub=" << topic.publishers << " sub=" << topic.subscribers;
+        if (ImGui::Selectable(label.str().c_str(), selected)) {
+          if (selected_topic_ != topic.name || selected_type_ != topic.type) {
+            unsubscribeCurrentTopic();
+            selected_topic_ = topic.name;
+            selected_type_ = topic.type;
+            applyPresetForCurrentTopic();
+            clearMessages();
+            value_tree_.clear();
+            value_error_.clear();
+          }
         }
       }
-    }
-    ImGui::EndChild();
-
-    ImGui::Separator();
-    ImGui::Text("Selected: %s", selected_topic_.empty() ? "<none>" : selected_topic_.c_str());
-    ImGui::Text("Type: %s", selected_type_.empty() ? "<none>" : selected_type_.c_str());
-
-    if (!selected_type_.empty() && selected_type_ != last_schema_type_) {
-      refreshFieldTree();
+      ImGui::EndChild();
+      drawVerticalResizeHandle("topic_list_resize", topic_list_height_, 100.0f, 700.0f);
     }
 
-    ImGui::SameLine();
-    if (ImGui::Button("Refresh fields") && !selected_type_.empty()) {
-      refreshFieldTree();
-    }
+    if (ImGui::CollapsingHeader("Controls", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::Text("Selected: %s", selected_topic_.empty() ? "<none>" : selected_topic_.c_str());
+      ImGui::Text("Type: %s", selected_type_.empty() ? "<none>" : selected_type_.c_str());
 
-    ImGui::Separator();
-    ImGui::TextUnformatted("Profile");
-    int profile_index = static_cast<int>(active_profile_);
-    static const char *kProfileLabels[] = {"Auto", "Normal", "Image", "Custom"};
-    if (ImGui::Combo("Preset", &profile_index, kProfileLabels, IM_ARRAYSIZE(kProfileLabels))) {
-      const auto selected_profile = static_cast<PresetProfile>(profile_index);
-      if (selected_profile == PresetProfile::Custom) {
+      if (!selected_type_.empty() && selected_type_ != last_schema_type_) {
+        refreshFieldTree();
+      }
+
+      if (ImGui::Button("Refresh fields") && !selected_type_.empty()) {
+        refreshFieldTree();
+      }
+
+      ImGui::Separator();
+      ImGui::TextUnformatted("Profile");
+      int profile_index = static_cast<int>(active_profile_);
+      static const char *kProfileLabels[] = {"Auto", "Normal", "Image", "Custom"};
+      if (ImGui::Combo("Preset", &profile_index, kProfileLabels, IM_ARRAYSIZE(kProfileLabels))) {
+        const auto selected_profile = static_cast<PresetProfile>(profile_index);
+        if (selected_profile == PresetProfile::Custom) {
+          active_profile_ = PresetProfile::Custom;
+        } else {
+          applyPreset(selected_profile, false);
+        }
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Apply preset") && active_profile_ != PresetProfile::Custom) {
+        applyPreset(active_profile_, false);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Save for topic") && !selected_topic_.empty()) {
+        savePresetForCurrentTopic(active_profile_);
+      }
+
+      bool settings_changed = false;
+      settings_changed |= ImGui::SliderInt("Throttle (ms)", &throttle_ms_, 0, 1000);
+      settings_changed |= ImGui::SliderInt("Decode throttle (ms)", &decode_throttle_ms_, 0, 2000);
+      settings_changed |= ImGui::SliderInt("Max array items", &max_array_items_, 0, 512);
+      settings_changed |= ImGui::Checkbox("Skip large arrays", &skip_large_arrays_);
+      if (settings_changed) {
         active_profile_ = PresetProfile::Custom;
+      }
+      ImGui::Checkbox("Autoscroll", &autoscroll_);
+      ImGui::Checkbox("Pause", &paused_);
+      if (ImGui::SliderInt("Max messages", &max_messages_, 50, 5000)) {
+        active_profile_ = PresetProfile::Custom;
+      }
+
+      if (!selected_topic_.empty() && !subscribed_) {
+        if (ImGui::Button("Subscribe")) {
+          subscribeCurrentTopic();
+        }
+      } else if (subscribed_) {
+        if (ImGui::Button("Unsubscribe")) {
+          unsubscribeCurrentTopic();
+        }
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Clear")) {
+        clearMessages();
+      }
+    }
+
+    if (ImGui::CollapsingHeader("Field Tree", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::BeginChild("field_tree", ImVec2(0.0f, field_tree_height_), true);
+      if (selected_type_.empty()) {
+        ImGui::TextUnformatted("Select topic to inspect fields.");
+      } else if (!schema_error_.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", schema_error_.c_str());
+      } else if (field_tree_.empty()) {
+        ImGui::TextUnformatted("No fields parsed.");
       } else {
-        applyPreset(selected_profile, false);
+        for (const auto &root : field_tree_) {
+          drawFieldTreeNode(root);
+        }
       }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Apply preset") && active_profile_ != PresetProfile::Custom) {
-      applyPreset(active_profile_, false);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Save for topic") && !selected_topic_.empty()) {
-      savePresetForCurrentTopic(active_profile_);
+      ImGui::EndChild();
+      drawVerticalResizeHandle("field_tree_resize", field_tree_height_, 100.0f, 700.0f);
     }
 
-    bool settings_changed = false;
-    settings_changed |= ImGui::SliderInt("Throttle (ms)", &throttle_ms_, 0, 1000);
-    settings_changed |= ImGui::SliderInt("Decode throttle (ms)", &decode_throttle_ms_, 0, 2000);
-    settings_changed |= ImGui::SliderInt("Max array items", &max_array_items_, 0, 512);
-    settings_changed |= ImGui::Checkbox("Skip large arrays", &skip_large_arrays_);
-    if (settings_changed) {
-      active_profile_ = PresetProfile::Custom;
-    }
-    ImGui::Checkbox("Autoscroll", &autoscroll_);
-    ImGui::Checkbox("Pause", &paused_);
-    if (ImGui::SliderInt("Max messages", &max_messages_, 50, 5000)) {
-      active_profile_ = PresetProfile::Custom;
-    }
-
-    if (!selected_topic_.empty() && !subscribed_) {
-      if (ImGui::Button("Subscribe")) {
-        subscribeCurrentTopic();
-      }
-    } else if (subscribed_) {
-      if (ImGui::Button("Unsubscribe")) {
-        unsubscribeCurrentTopic();
-      }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Clear")) {
-      clearMessages();
-    }
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Field Tree");
-    ImGui::BeginChild("field_tree", ImVec2(0.0f, 180.0f), true);
-    if (selected_type_.empty()) {
-      ImGui::TextUnformatted("Select topic to inspect fields.");
-    } else if (!schema_error_.empty()) {
-      ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", schema_error_.c_str());
-    } else if (field_tree_.empty()) {
-      ImGui::TextUnformatted("No fields parsed.");
-    } else {
-      for (const auto &root : field_tree_) {
-        drawFieldTreeNode(root);
-      }
-    }
-    ImGui::EndChild();
-
-    ImGui::Separator();
-    ImGui::TextUnformatted("Value Tree");
-    ImGui::BeginChild("value_tree", ImVec2(0.0f, 180.0f), true);
-    std::string local_value_error;
-    std::vector<ValueTreeNode> local_value_tree;
-    {
-      std::scoped_lock lock(value_mutex_);
-      local_value_error = value_error_;
-      local_value_tree = value_tree_;
-    }
-
-    if (selected_topic_.empty()) {
-      ImGui::TextUnformatted("Select topic to inspect values.");
-    } else if (!local_value_error.empty()) {
-      ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", local_value_error.c_str());
-    } else {
-      if (local_value_tree.empty()) {
-        ImGui::TextUnformatted("No decoded values yet. Subscribe and wait for messages.");
-      }
-      for (const auto &root : local_value_tree) {
-        drawValueTreeNode(root);
-      }
-    }
-    ImGui::EndChild();
-
-    ImGui::Separator();
-    ImGui::Text("Received: %llu", static_cast<unsigned long long>(message_counter_.load()));
-    ImGui::SameLine();
-    ImGui::Text("Decoded: %llu", static_cast<unsigned long long>(decoded_counter_.load()));
-
-    ImGui::BeginChild("message_view", ImVec2(0.0f, 0.0f), true);
-    {
-      std::scoped_lock lock(messages_mutex_);
-      for (const auto &line : messages_) {
-        ImGui::TextWrapped("%s", line.c_str());
+    if (ImGui::CollapsingHeader("Value Tree", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::BeginChild("value_tree", ImVec2(0.0f, value_tree_height_), true);
+      std::string local_value_error;
+      std::vector<ValueTreeNode> local_value_tree;
+      {
+        std::scoped_lock lock(value_mutex_);
+        local_value_error = value_error_;
+        local_value_tree = value_tree_;
       }
 
-      if (autoscroll_ && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 20.0f) {
-        ImGui::SetScrollHereY(1.0f);
+      if (selected_topic_.empty()) {
+        ImGui::TextUnformatted("Select topic to inspect values.");
+      } else if (!local_value_error.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", local_value_error.c_str());
+      } else {
+        if (local_value_tree.empty()) {
+          ImGui::TextUnformatted("No decoded values yet. Subscribe and wait for messages.");
+        }
+        for (const auto &root : local_value_tree) {
+          drawValueTreeNode(root);
+        }
       }
+      ImGui::EndChild();
+      drawVerticalResizeHandle("value_tree_resize", value_tree_height_, 100.0f, 700.0f);
     }
-    ImGui::EndChild();
+
+    if (ImGui::CollapsingHeader("Message View", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::Text("Received: %llu", static_cast<unsigned long long>(message_counter_.load()));
+      ImGui::SameLine();
+      ImGui::Text("Decoded: %llu", static_cast<unsigned long long>(decoded_counter_.load()));
+
+      ImGui::BeginChild("message_view", ImVec2(0.0f, message_view_height_), true);
+      {
+        std::scoped_lock lock(messages_mutex_);
+        for (const auto &line : messages_) {
+          ImGui::TextWrapped("%s", line.c_str());
+        }
+
+        if (autoscroll_ && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 20.0f) {
+          ImGui::SetScrollHereY(1.0f);
+        }
+      }
+      ImGui::EndChild();
+      drawVerticalResizeHandle("message_view_resize", message_view_height_, 120.0f, 900.0f);
+    }
 
     ImGui::End();
   }
@@ -902,6 +919,10 @@ private:
   int decode_throttle_ms_{250};
   int max_array_items_{64};
   int max_messages_{500};
+  float topic_list_height_{180.0f};
+  float field_tree_height_{180.0f};
+  float value_tree_height_{180.0f};
+  float message_view_height_{240.0f};
   std::vector<TopicPresetBinding> topic_presets_;
 
   std::mutex messages_mutex_;
